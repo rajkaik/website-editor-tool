@@ -77,20 +77,41 @@
     frame.hidden = false;
     saveBtn.disabled = false;
     frame.srcdoc = text;
-    // Inject inspector after the frame's document is ready.
-    frame.addEventListener('load', onFrameLoad, { once: true });
+    // Inject inspector as soon as the iframe's DOM is parsed. We don't wait
+    // for `load` because that blocks on subresources (images, stylesheets)
+    // which may be slow or unreachable.
+    injectInspectorWhenReady();
   }
 
-  function onFrameLoad() {
-    try {
+  function injectInspectorWhenReady() {
+    // Setting srcdoc triggers an async navigation: the iframe's current
+    // document (often about:blank) is replaced with the srcdoc document.
+    // Poll until contentDocument.URL is no longer about:blank AND the body
+    // has been parsed, then inject. Don't wait for the `load` event because
+    // it blocks on subresources (images/stylesheets) which may stall.
+    var attempts = 0;
+    function tick() {
+      attempts++;
       var fdoc = frame.contentDocument;
-      if (!fdoc) return;
-      var s = fdoc.createElement('script');
-      s.textContent = inspectorSource;
-      fdoc.documentElement.appendChild(s);
-    } catch (err) {
-      console.error('Failed to inject inspector:', err);
+      var ready = fdoc
+        && fdoc.URL !== 'about:blank'
+        && fdoc.documentElement
+        && fdoc.body
+        && fdoc.readyState !== 'loading';
+      if (!ready) {
+        if (attempts > 400) return; // ~10s ceiling
+        return setTimeout(tick, 25);
+      }
+      if (fdoc.defaultView.__editorInspectorLoaded) return;
+      try {
+        var s = fdoc.createElement('script');
+        s.textContent = inspectorSource;
+        fdoc.documentElement.appendChild(s);
+      } catch (err) {
+        console.error('Failed to inject inspector:', err);
+      }
     }
+    setTimeout(tick, 0);
   }
 
   // --- Edit panel ---------------------------------------------------------
