@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Website Editor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <button id="open-btn" type="button">Open HTML</button>
+    <button id="save-btn" type="button" disabled>Save Copy</button>
+    <span id="file-label" class="file-label">No file open</span>
+    <span id="dirty-indicator" class="dirty-indicator" hidden>● unsaved</span>
+    <span class="spacer"></span>
+    <span class="hint">Hover an element, click to select, then confirm.</span>
+  </header>
+
+  <main class="stage">
+    <div id="empty-state" class="empty-state">
+      <h1>Website Editor</h1>
+      <p>Click <strong>Open HTML</strong> to load a local <code>.html</code> file.</p>
+      <p class="muted">
+        Requires a Chromium-based browser (Chrome, Edge, Brave, Opera) for direct file save.
+        Other browsers can still open and download an edited copy.
+      </p>
+    </div>
+    <iframe id="frame" title="Edited page" hidden></iframe>
+  </main>
+
+  <aside id="edit-panel" class="edit-panel" hidden>
+    <div class="edit-panel-header">
+      <strong id="edit-panel-title">Edit element</strong>
+      <button id="edit-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="edit-fields" class="edit-fields"></div>
+    <div class="edit-panel-footer">
+      <button id="edit-cancel" type="button">Cancel</button>
+      <button id="edit-apply" type="button" class="primary">Apply</button>
+    </div>
+  </aside>
+
+  <!--
+    Inspector script injected into the loaded iframe.
+    Kept as inline text (not src=) so it works when index.html is opened via file://
+    where cross-file fetches are blocked.
+  -->
+  <script type="text/x-inspector" id="inspector-source">
+    (function () {
+      if (window.__editorInspectorLoaded) return;
+      window.__editorInspectorLoaded = true;
+
+      var HOVER_ATTR = 'data-editor-hover';
+      var SELECTED_ATTR = 'data-editor-selected';
+      var doc = document;
+
+      // Inject overlay styles.
+      var style = doc.createElement('style');
+      style.id = '__editor-inspector-style';
+      style.textContent =
+        '[' + HOVER_ATTR + '] { outline: 2px solid #4c9aff !important; outline-offset: 2px !important; cursor: pointer !important; }' +
+        '[' + SELECTED_ATTR + '] { outline: 2px solid #ff8a3d !important; outline-offset: 2px !important; }' +
+        '#__editor-confirm-popover {' +
+        '  position: absolute; z-index: 2147483647;' +
+        '  background: #2a2c30; color: #e6e7e9;' +
+        '  border: 1px solid #404349; border-radius: 6px;' +
+        '  font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;' +
+        '  box-shadow: 0 8px 24px rgba(0,0,0,0.4);' +
+        '  padding: 10px 12px; min-width: 220px;' +
+        '}' +
+        '#__editor-confirm-popover .tag { color: #4c9aff; font-family: ui-monospace, Menlo, monospace; }' +
+        '#__editor-confirm-popover .preview { color: #a3a6ab; font-size: 11px; margin-top: 4px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }' +
+        '#__editor-confirm-popover .actions { display:flex; gap:6px; margin-top: 10px; justify-content: flex-end; }' +
+        '#__editor-confirm-popover button { font: inherit; padding: 4px 10px; border-radius: 4px; border: 1px solid #404349; background: #34373c; color: #e6e7e9; cursor: pointer; }' +
+        '#__editor-confirm-popover button.primary { background: #4c9aff; border-color: #4c9aff; color: #fff; }' +
+        '#__editor-confirm-popover button:hover { filter: brightness(1.1); }';
+      (doc.head || doc.documentElement).appendChild(style);
+
+      var hovered = null;
+      var popover = null;
+      var frozen = false; // true while popover is up; pause hover updates
+
+      function clearHover() {
+        if (hovered) { hovered.removeAttribute(HOVER_ATTR); hovered = null; }
+      }
+      function clearSelected() {
+        var prev = doc.querySelector('[' + SELECTED_ATTR + ']');
+        if (prev) prev.removeAttribute(SELECTED_ATTR);
+      }
+
+      function isEditableElement(el) {
+        if (!el || !el.tagName) return false;
+        if (el === doc.documentElement || el === doc.body) return false;
+        if (el.id === '__editor-confirm-popover' || el.closest && el.closest('#__editor-confirm-popover')) return false;
+        return true;
+      }
+
+      doc.addEventListener('mouseover', function (e) {
+        if (frozen) return;
+        var t = e.target;
+        if (!isEditableElement(t)) return;
+        if (hovered === t) return;
+        clearHover();
+        hovered = t;
+        t.setAttribute(HOVER_ATTR, '');
+      }, true);
+
+      doc.addEventListener('mouseout', function (e) {
+        if (frozen) return;
+        if (e.target === hovered) clearHover();
+      }, true);
+
+      // Suppress native interactions while inspector is active.
+      function swallow(e) {
+        if (e.target && e.target.closest && e.target.closest('#__editor-confirm-popover')) return;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      doc.addEventListener('submit', swallow, true);
+      doc.addEventListener('dragstart', swallow, true);
+
+      doc.addEventListener('click', function (e) {
+        if (e.target && e.target.closest && e.target.closest('#__editor-confirm-popover')) return;
+        var t = e.target;
+        if (!isEditableElement(t)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        showConfirm(t, e.clientX, e.clientY);
+      }, true);
+
+      // Build a stable selector path from <html> to the element.
+      function selectorFor(el) {
+        var parts = [];
+        var cur = el;
+        while (cur && cur.nodeType === 1 && cur !== doc.documentElement) {
+          var parent = cur.parentNode;
+          if (!parent) break;
+          var tag = cur.tagName.toLowerCase();
+          var sameTag = 0, index = 0;
+          for (var i = 0; i < parent.children.length; i++) {
+            var sib = parent.children[i];
+            if (sib.tagName === cur.tagName) {
+              sameTag++;
+              if (sib === cur) index = sameTag;
+            }
+          }
+          parts.unshift(tag + ':nth-of-type(' + index + ')');
+          cur = parent;
+        }
+        parts.unshift('html');
+        return parts.join(' > ');
+      }
+
+      function elementKind(el) {
+        var tag = el.tagName.toLowerCase();
+        if (tag === 'img') return 'image';
+        if (tag === 'a') {
+          if (el.querySelector('img')) return 'image-link';
+          return 'link';
+        }
+        return 'text';
+      }
+
+      function shortPreview(el) {
+        var kind = elementKind(el);
+        if (kind === 'image' || kind === 'image-link') {
+          var img = el.tagName.toLowerCase() === 'img' ? el : el.querySelector('img');
+          return img ? (img.getAttribute('src') || '') : '';
+        }
+        var text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text.length > 60) text = text.slice(0, 60) + '…';
+        return text;
+      }
+
+      function showConfirm(el, x, y) {
+        hideConfirm();
+        frozen = true;
+        clearHover();
+        clearSelected();
+        el.setAttribute(SELECTED_ATTR, '');
+
+        var rect = el.getBoundingClientRect();
+        var scrollX = doc.defaultView.scrollX || 0;
+        var scrollY = doc.defaultView.scrollY || 0;
+
+        popover = doc.createElement('div');
+        popover.id = '__editor-confirm-popover';
+
+        var tag = doc.createElement('div');
+        tag.innerHTML = 'Edit this <span class="tag">&lt;' + el.tagName.toLowerCase() + '&gt;</span> element?';
+        popover.appendChild(tag);
+
+        var preview = doc.createElement('div');
+        preview.className = 'preview';
+        preview.textContent = shortPreview(el);
+        popover.appendChild(preview);
+
+        var actions = doc.createElement('div');
+        actions.className = 'actions';
+        var cancel = doc.createElement('button');
+        cancel.textContent = 'Cancel';
+        cancel.addEventListener('click', function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          hideConfirm();
+        });
+        var yes = doc.createElement('button');
+        yes.className = 'primary';
+        yes.textContent = 'Yes, edit';
+        yes.addEventListener('click', function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          var path = selectorFor(el);
+          window.parent.postMessage({
+            source: 'editor-inspector',
+            type: 'edit-request',
+            selector: path,
+            kind: elementKind(el)
+          }, '*');
+          hideConfirm(true);
+        });
+        actions.appendChild(cancel);
+        actions.appendChild(yes);
+        popover.appendChild(actions);
+
+        doc.body.appendChild(popover);
+
+        // Position near the element, clamped to viewport.
+        var pop = popover.getBoundingClientRect();
+        var top = rect.bottom + scrollY + 6;
+        var left = rect.left + scrollX;
+        var maxLeft = scrollX + doc.documentElement.clientWidth - pop.width - 8;
+        if (left > maxLeft) left = maxLeft;
+        if (left < scrollX + 8) left = scrollX + 8;
+        if (top + pop.height > scrollY + doc.documentElement.clientHeight) {
+          top = rect.top + scrollY - pop.height - 6;
+        }
+        popover.style.top = top + 'px';
+        popover.style.left = left + 'px';
+      }
+
+      function hideConfirm(keepSelected) {
+        if (popover && popover.parentNode) popover.parentNode.removeChild(popover);
+        popover = null;
+        frozen = false;
+        if (!keepSelected) clearSelected();
+      }
+
+      // Allow parent to clear selection highlights after edits.
+      window.addEventListener('message', function (e) {
+        var data = e.data;
+        if (!data || data.source !== 'editor-parent') return;
+        if (data.type === 'clear-selection') { clearSelected(); hideConfirm(); }
+      });
+
+      doc.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') hideConfirm();
+      });
+    })();
+  </script>
+  <script src="editor.js"></script>
+</body>
+</html>
